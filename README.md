@@ -34,11 +34,12 @@ Accuracy (%) reported in the paper, using Qwen3-VL-4B as the backbone:
 
 ## Code
 
+- `infer.py`: two-stage inference on your own images and question.
 - `agent_tool_wrapper.py`: target-conditioned perception and spatial descriptions.
 - `core.py`: mask-to-3D projection and object memory.
 - `perception/` and `geometry/`: SAM3 and Pi3X interfaces.
 - `eval_mindcube.py`, `eval_mmsi_bench.py`, and `ours/evaluation/eval_viewspatial.py`: benchmark evaluation.
-- `ours/training/grpo_stage2/`: GRPO training with cached spatial information.
+- `ours/training/grpo_stage2/`: geometry caching, positive/negative data preparation, GRPO training, and a launch script.
 
 ## Setup
 
@@ -66,6 +67,16 @@ export VLM_MODEL=Qwen/Qwen3-VL-4B-Instruct
 `PI3_PATH` and `SAM3_PATH` can point to source checkouts outside `third_party/`. `VLM_MODEL` also accepts a local Hugging Face model directory, including a trained Stage 2 model.
 
 ## Run the perception tool
+
+For an end-to-end answer:
+
+```bash
+python infer.py --images scene/view1.jpg scene/view2.jpg \
+  --question "Where is the chair relative to the table?" \
+  --output outputs/example.json
+```
+
+To call the geometry tool directly:
 
 ```python
 from agent_tool_wrapper import AgentToolWrapper, format_tool_result_for_model
@@ -112,6 +123,18 @@ pip install flash-attn --no-build-isolation
 
 The trainer reads JSONL records with `question`, `images`, `formatted_3d`, `gt_answer`, and `sample_type`. Image entries are local paths; `formatted_3d` is the tool's text output. `sample_type` is `positive` (baseline incorrect, tool-assisted answer correct) or `negative` (baseline correct, tool-assisted answer incorrect). Optional `stage2_system` and `stage2_prompt` fields override the prompt template. Construct these records from the training split.
 
+Cache geometry and collect disagreement examples from a MindCube-format training split, then combine the two groups:
+
+```bash
+python ours/training/grpo_stage2/cache_geometry.py \
+  --data_path data/mindcube_train.jsonl --image_root data \
+  --output_dir data/grpo_aligned
+python ours/training/grpo_stage2/prepare_data.py \
+  --positive data/grpo_aligned/grpo_stage2_positive_quality.jsonl \
+  --negative data/grpo_aligned/grpo_stage2_negative_quality.jsonl \
+  --output data/stage2_train.jsonl
+```
+
 An example two-GPU launch:
 
 ```bash
@@ -123,6 +146,8 @@ torchrun --standalone --nproc_per_node=2 ours/training/grpo_stage2/train.py \
 ```
 
 The trainer uses ZeRO-2, a frozen vision encoder, within-prompt reward normalization, and a reference-policy KL penalty. The generation group size must be divisible by the GPU count. Training writes DeepSpeed checkpoints and Hugging Face models under the output directory and resumes from its latest step checkpoint.
+
+Alternatively, set `DATA_PATH`, `OUTPUT_DIR`, and optionally `NUM_GPUS`, then run `bash ours/training/grpo_stage2/run_train.sh`. For full-split evaluation, use `bash ours/evaluation/run_eval.sh mindcube` (or `mmsi` / `viewspatial`) with the data paths above.
 
 ## Tests
 
