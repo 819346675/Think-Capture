@@ -1,0 +1,16 @@
+numpy>=1.26,<2
+Pillow>=10
+torch>=2.7,<3
+torchvision>=0.22,<1
+transformers>=4.57,<5
+accelerate>=1.0
+qwen-vl-utils>=0.0.14
+huggingface-hub>=0.34,<1
+pandas>=2.0
+opencv-python<4.12
+plyfile
+safetensors
+einops
+timm>=1.0.17
+# Install SAM3 and Pi3X from their upstream repositories (see README).
+# Training additionally uses deepspeed and flash-attn.
