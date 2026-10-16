@@ -28,7 +28,7 @@ Reasoning:"""
 STAGE2_SYSTEM_TRAINING = (
     "You are a spatial reasoning assistant with 3D perception.\n"
     "Use both the images and the 3D spatial data to answer. "
-    "Think step by step and combine visual cues with 3D information. "
+    "Put the reasoning in <think>...</think> and combine visual cues with 3D information. "
     "You MUST end with <answer>X</answer> where X is A, B, C, or D."
 )
 
