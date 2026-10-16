@@ -17,7 +17,7 @@ Training Flow (per training step):
 
 Configuration Requirements:
   - 2 x GPU, DeepSpeed ZeRO-2
-  - gradient_accumulation_steps = num_generations // num_gpus = 4
+  - gradient_accumulation_steps = prompts_per_step * num_generations // num_gpus
   - train_micro_batch_size_per_gpu = 1
 
 Usage:
@@ -52,6 +52,9 @@ from transformers import (
     get_cosine_schedule_with_warmup,
 )
 from qwen_vl_utils import process_vision_info
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "evaluation"))
+from stage2_prompt_constants import STAGE2_SYSTEM_TRAINING, build_stage2_prompt_training
 
 # ======================================================================
 #  Logging
@@ -136,8 +139,10 @@ def compute_rewards(
 
     Positive (baseline wrong + 3D correct): accuracy_weight_positive points if correct
     Negative (baseline correct + 3D wrong): accuracy_weight_negative points if correct
-    Format (contains <answer>X</answer>): format_weight points
+    Format (<think>...</think><answer>X</answer>): format_weight points
     """
+    if sample_type not in {"positive", "negative"}:
+        raise ValueError(f"Unknown sample_type: {sample_type}")
     rewards = []
     gt_upper = gt_answer.strip().upper()
 
@@ -153,7 +158,10 @@ def compute_rewards(
 
         # Format reward
         fmt_reward = 0.0
-        if re.search(r"<answer>\s*[A-D]\s*</answer>", comp, re.IGNORECASE):
+        if re.fullmatch(
+            r"\s*<think>(?:(?!</?think>|</?answer>).)*</think>\s*<answer>\s*[A-D]\s*</answer>\s*",
+            comp, re.IGNORECASE | re.DOTALL,
+        ):
             fmt_reward = format_weight
 
         rewards.append(acc_reward + fmt_reward)
@@ -168,18 +176,11 @@ def build_messages(sample: Dict[str, Any]) -> List[Dict]:
     """Construct Stage 2 conversational messages (system + user with images + 3D info)."""
     system_prompt = sample.get(
         "stage2_system",
-        "You are a spatial reasoning assistant with 3D perception.\n"
-        "Use both the images and the 3D spatial data to answer. "
-        "Think step by step and combine visual cues with 3D information. "
-        "You MUST end with <answer>X</answer> where X is A, B, C, or D.",
+        STAGE2_SYSTEM_TRAINING,
     )
     user_prompt = sample.get(
         "stage2_prompt",
-        f"Question: {sample['question']}\n\n"
-        f"3D Spatial Information:\n{sample['formatted_3d']}\n\n"
-        "Answer the question by combining the images above with the "
-        "3D spatial information. Think step by step, then give your final answer.\n\n"
-        "Reasoning:",
+        build_stage2_prompt_training(sample['question'], sample['formatted_3d']),
     )
 
     user_content: List[Dict] = []
@@ -397,8 +398,15 @@ class GRPOStage2Trainer:
             weight_decay=args.weight_decay,
         )
 
-        total_steps = len(self.dataset) * args.num_epochs
-        warmup_steps = min(args.warmup_steps, total_steps // 10)
+        if args.prompts_per_step < 1:
+            raise ValueError("prompts_per_step must be positive")
+        self.steps_per_epoch = len(self.dataset) // args.prompts_per_step
+        if self.steps_per_epoch == 0:
+            raise ValueError("Dataset must contain at least prompts_per_step samples")
+        total_steps = self.steps_per_epoch * args.num_epochs
+        if args.max_steps > 0:
+            total_steps = min(total_steps, args.max_steps)
+        warmup_steps = min(args.warmup_steps, total_steps)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
@@ -412,7 +420,7 @@ class GRPOStage2Trainer:
         if args.num_generations < 2 or args.num_generations % self.world_size:
             raise ValueError("num_generations must be >=2 and divisible by world_size")
         self.num_gen_per_gpu = args.num_generations // self.world_size
-        ds_config["gradient_accumulation_steps"] = self.num_gen_per_gpu
+        ds_config["gradient_accumulation_steps"] = self.num_gen_per_gpu * args.prompts_per_step
         ds_config["train_micro_batch_size_per_gpu"] = 1
 
         self.model_engine, self.optimizer, _, self.scheduler = deepspeed.initialize(
@@ -881,13 +889,18 @@ class GRPOStage2Trainer:
         total_steps_done = self.global_step
 
         for epoch in range(self.start_epoch, args.num_epochs):
+            if args.max_steps > 0 and self.global_step >= args.max_steps:
+                break
             # Data order for this epoch (consistent across all GPUs)
             epoch_rng = random.Random(args.seed + epoch)
             indices = list(range(len(self.dataset)))
             epoch_rng.shuffle(indices)
+            # Keep only complete accumulation groups, so checkpoints always
+            # correspond to an optimizer boundary.
+            indices = indices[:self.steps_per_epoch * args.prompts_per_step]
 
             # Skip completed steps
-            steps_to_skip = total_steps_done - epoch * len(self.dataset)
+            steps_to_skip = (total_steps_done - epoch * self.steps_per_epoch) * args.prompts_per_step
             if steps_to_skip > 0 and steps_to_skip < len(indices):
                 indices = indices[steps_to_skip:]
                 if self.is_main:
@@ -900,12 +913,16 @@ class GRPOStage2Trainer:
             epoch_metrics: List[Dict] = []
 
             for local_step, idx in enumerate(indices):
+                if args.max_steps > 0 and self.global_step >= args.max_steps:
+                    break
                 sample = self.dataset[idx]
 
                 try:
                     metrics = self._train_step(sample)
                     epoch_metrics.append(metrics)
-                    self.global_step += 1
+                    optimizer_boundary = (local_step + 1) % args.prompts_per_step == 0
+                    if optimizer_boundary:
+                        self.global_step += 1
 
                     # ---- Print detailed log every step ----
                     if self.is_main:
@@ -946,7 +963,7 @@ class GRPOStage2Trainer:
                         log_file.flush()
 
                     # ---- Sliding window summary (every log_every steps) ----
-                    if self.is_main and self.global_step % args.log_every == 0:
+                    if self.is_main and optimizer_boundary and self.global_step % args.log_every == 0:
                         window = epoch_metrics[-args.log_every:]
                         w_loss = np.mean([m["loss"] for m in window])
                         w_reward = np.mean([m["reward_mean"] for m in window])
@@ -964,7 +981,7 @@ class GRPOStage2Trainer:
                         )
 
                     # ---- Save checkpoint ----
-                    if self.global_step % args.save_every == 0:
+                    if optimizer_boundary and self.global_step % args.save_every == 0:
                         self._save_checkpoint(f"step_{self.global_step}", epoch)
                         if self.is_main:
                             logger.info(f"  💾 Checkpoint saved: step_{self.global_step}")
@@ -1056,6 +1073,10 @@ def parse_args():
 
     # Training hyperparams
     parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--max_steps", type=int, default=1600,
+                        help="Maximum optimizer updates; <=0 uses all epochs")
+    parser.add_argument("--prompts_per_step", type=int, default=2,
+                        help="Prompts per optimizer update; 2 x 8 completions gives batch size 16")
     parser.add_argument("--learning_rate", type=float, default=5e-7)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--warmup_steps", type=int, default=50)
