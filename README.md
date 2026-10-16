@@ -17,7 +17,7 @@ Xiaoyu Ye · Yueru Luo · Xu Yan · Chun-Mei Feng · Zhen Li
 
 Think-Capture lets a vision-language model select the objects it needs to inspect, obtains their geometry with SAM3 and Pi3X, and uses the resulting spatial descriptions to answer the question.
 
-![Passive fusion and Think-Capture's active geometry acquisition](assets/paradigm.png)
+![Think-Capture method: target selection, 3D acquisition, symbolic reasoning, and GRPO training](assets/method.png)
 
 **Select targets, capture geometry, reason with evidence.** The model first identifies task-relevant objects. SAM3 masks are lifted into a shared 3D frame using Pi3X, then object and camera geometry is expressed as compact text for the second reasoning stage. GRPO training uses examples where geometry helps and examples where it misleads, so the model learns to combine spatial evidence with the original images.
 
@@ -89,7 +89,7 @@ result = tool.process_images(
 print(format_tool_result_for_model(result, question="Where is the chair relative to the table?"))
 ```
 
-Input frames must share a resolution. At most four frames are sampled uniformly for geometry extraction. Geometry is anchored to the first selected camera, with OpenCV axes (+X right, +Y down, +Z forward). Distances use Pi3X's estimated metric scale. Model failures are reported as errors; `use_mock=True` is an explicit synthetic test mode.
+Input frames must share a resolution. At most four frames are sampled uniformly for geometry extraction. Geometry is anchored to the first selected camera, with OpenCV axes (+X right, +Y down, +Z forward). Same-label observations are fused across views by nearest-centroid matching within 0.5 m. Distances use Pi3X's estimated metric scale.
 
 ## Evaluation
 
@@ -135,17 +135,17 @@ python ours/training/grpo_stage2/prepare_data.py \
   --output data/stage2_train.jsonl
 ```
 
-An example two-GPU launch:
+An example four-GPU launch:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 ours/training/grpo_stage2/train.py \
+torchrun --standalone --nproc_per_node=4 ours/training/grpo_stage2/train.py \
   --model_path Qwen/Qwen3-VL-4B-Instruct \
   --data_path data/stage2_train.jsonl \
   --output_dir outputs/grpo_stage2 \
-  --num_generations 8
+  --num_generations 8 --prompts_per_step 2 --max_steps 1600
 ```
 
-The trainer uses ZeRO-2, a frozen vision encoder, within-prompt reward normalization, and a reference-policy KL penalty. The generation group size must be divisible by the GPU count. Training writes DeepSpeed checkpoints and Hugging Face models under the output directory and resumes from its latest step checkpoint.
+The trainer uses ZeRO-2, a frozen vision encoder, within-prompt reward normalization, and a reference-policy KL penalty. It accumulates two prompts with eight completions each per optimizer update (16 completions), with a default limit of 1,600 updates. Correct answers receive +1 for positive samples or +2 for negative samples; complete `<think>...</think><answer>...</answer>` formatting receives +0.5. The generation group size must be divisible by the GPU count. Training writes DeepSpeed checkpoints and Hugging Face models under the output directory and resumes from its latest step checkpoint.
 
 Alternatively, set `DATA_PATH`, `OUTPUT_DIR`, and optionally `NUM_GPUS`, then run `bash ours/training/grpo_stage2/run_train.sh`. For full-split evaluation, use `bash ours/evaluation/run_eval.sh mindcube` (or `mmsi` / `viewspatial`) with the data paths above.
 
@@ -172,4 +172,4 @@ python -m unittest discover -s tests -v
 
 Project code is released under the MIT License. We thank the developers of [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL), [SAM3](https://github.com/facebookresearch/sam3), and [Pi3X](https://github.com/yyfz/Pi3). Third-party code, checkpoints, and datasets remain subject to their respective licenses and access terms.
 
-The method illustration is from the Think-Capture paper (Figure 1).
+The method illustration is Figure 2 of the Think-Capture paper.

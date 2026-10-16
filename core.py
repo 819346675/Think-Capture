@@ -140,7 +140,7 @@ class SpatialMemoryManager:
 
     def compute_aabb(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute axis-aligned bounding box center and scale.
+        Compute the point centroid and axis-aligned bounding-box scale.
 
         Args:
             points: Nx3 array of 3D points
@@ -157,15 +157,14 @@ class SpatialMemoryManager:
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points)
             aabb = pcd.get_axis_aligned_bounding_box()
-            center = np.array(aabb.get_center())
             scale = np.array(aabb.get_extent())
         else:
             # Fallback to numpy
             min_coords = np.min(points, axis=0)
             max_coords = np.max(points, axis=0)
-            center = (min_coords + max_coords) / 2
             scale = max_coords - min_coords
 
+        center = np.mean(points, axis=0)
         return center, scale
 
     def update(self, frames_data: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -208,6 +207,11 @@ class SpatialMemoryManager:
             for obj_id in self.memory.keys():
                 self.memory[obj_id].is_visible = False
 
+            # Match each prior instance at most once in a frame. Detection IDs
+            # supplied by SAM3 are frame-local, not persistent tracking IDs.
+            prior_ids = set(self.memory)
+            matched_ids = set()
+
             # Process each detected object
             for mask, obj_id, label, conf in zip(masks, instance_ids, labels, confidences):
                 if conf < self.confidence_threshold:
@@ -218,6 +222,19 @@ class SpatialMemoryManager:
 
                 if len(world_points) == 0:
                     continue
+
+                center, scale = self.compute_aabb(world_points)
+                candidates = [
+                    (float(np.linalg.norm(center - self.memory[key].world_center)), key)
+                    for key in prior_ids - matched_ids
+                    if self.memory[key].label.strip().casefold() == label.strip().casefold()
+                ]
+                distance, nearest_id = min(candidates, default=(float('inf'), None))
+                if distance < self.merge_distance_threshold:
+                    obj_id = nearest_id
+                    matched_ids.add(obj_id)
+                else:
+                    obj_id = max(self.memory, default=-1) + 1
 
                 # Check if object exists in memory
                 if obj_id in self.memory:
@@ -245,8 +262,6 @@ class SpatialMemoryManager:
 
                 else:
                     # Create new object
-                    center, scale = self.compute_aabb(world_points)
-
                     self.memory[obj_id] = ObjectMemory(
                         instance_id=obj_id,
                         label=label,
