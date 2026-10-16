@@ -38,6 +38,42 @@ class GeometryTests(unittest.TestCase):
         np.testing.assert_allclose(obj['rel_pos'], [1, 0, 3])
         self.assertEqual(obj['last_seen_frame'], 7)
 
+    def test_centroid_not_box_midpoint(self):
+        center, scale = SpatialMemoryManager().compute_aabb(
+            np.array([[0., 0., 0.], [0., 0., 0.], [3., 3., 3.]]))
+        np.testing.assert_allclose(center, [1, 1, 1])
+        np.testing.assert_allclose(scale, [3, 3, 3])
+
+    @staticmethod
+    def frame(labels, positions, frame_idx):
+        return dict(masks=[np.ones((1, 1), dtype=bool) for _ in labels],
+                    instance_ids=list(range(len(labels))), labels=labels,
+                    confidences=[.9] * len(labels),
+                    local_point_map=np.array([[positions]], dtype=float),
+                    camera_pose=np.eye(4), frame_idx=frame_idx)
+
+    def test_cross_view_fusion(self):
+        manager = SpatialMemoryManager()
+        manager.update([self.frame(['chair'], [0, 0, 2], 0),
+                        self.frame(['chair'], [.2, 0, 2], 1)])
+        self.assertEqual(len(manager.memory), 1)
+        self.assertEqual(manager.memory[0].num_observations, 2)
+        np.testing.assert_allclose(manager.memory[0].world_center, [.1, 0, 2])
+
+    def test_fusion_preserves_distinct_labels_and_distant_instances(self):
+        manager = SpatialMemoryManager()
+        manager.update([self.frame(['chair'], [0, 0, 2], 0),
+                        self.frame(['table'], [.1, 0, 2], 1),
+                        self.frame(['chair'], [2, 0, 2], 2)])
+        self.assertEqual(len(manager.memory), 3)
+
+    def test_one_to_one_fusion(self):
+        manager = SpatialMemoryManager()
+        manager.update([self.frame(['chair'], [0, 0, 2], 0),
+                        self.frame(['chair', 'chair'], [.1, 0, 2], 1)])
+        self.assertEqual(len(manager.memory), 2)
+        self.assertEqual(sorted(o.num_observations for o in manager.memory.values()), [1, 2])
+
     def test_missing_dependencies_fail_closed(self):
         with patch('geometry.pi3_utils.PI3_AVAILABLE', False):
             with self.assertRaises(ImportError):
@@ -103,9 +139,13 @@ class RewardTests(unittest.TestCase):
         namespace = {'re': re, 'List': list}
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
         rewards = namespace['compute_rewards']
-        outputs = ['<answer>A</answer>', '<answer>B</answer>', 'Answer: A']
-        self.assertEqual(rewards(outputs, 'A', 'positive'), [1.5, .5, 1.])
-        self.assertEqual(rewards(outputs, 'A', 'negative'), [2.5, .5, 2.])
+        outputs = ['<think>Reason.</think><answer>A</answer>',
+                   '<think>Reason.</think><answer>B</answer>', 'Answer: A',
+                   '<answer>A</answer>', '<think>Unclosed<answer>A</answer>']
+        self.assertEqual(rewards(outputs, 'A', 'positive'), [1.5, .5, 1., 1., 1.])
+        self.assertEqual(rewards(outputs, 'A', 'negative'), [2.5, .5, 2., 2., 2.])
+        with self.assertRaises(ValueError):
+            rewards(outputs, 'A', 'invalid')
 
 
 if __name__ == '__main__':
